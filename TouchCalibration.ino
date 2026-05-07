@@ -1,5 +1,5 @@
 /**************************CrowPanel ESP32 Touch Debug & Calibration Tool***************
-  Version     : 1.1
+  Version     : 1.2
   Suitable for: CrowPanel ESP32 7-inch HMI Display (800x480, GT911 touch)
   Product link: https://www.elecrow.com/esp32-display-series-hmi-touch-screen.html
   Description : Boots with an on-screen debug console showing each init step,
@@ -11,10 +11,10 @@
 #include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
-#include <driver/i2c.h>
 #include <Wire.h>
-#include <SPI.h>
-#include <PCA9557.h>
+// PCA9557 configured via raw I2C writes — no external library dependency
+// Registers: 0x00=Input, 0x01=Output, 0x02=Polarity, 0x03=Config (0=out, 1=in)
+#define PCA9557_ADDR 0x18
 
 // --- Screen dimensions ---
 #define SCREEN_WIDTH 800
@@ -124,7 +124,6 @@ public:
 };
 
 LGFX tft;
-PCA9557 ioExpander;
 
 // ============================================================================
 // Debug console — buffered so early steps show even before display init
@@ -258,18 +257,16 @@ bool waitForTouch(uint16_t& tx, uint16_t& ty, unsigned long timeoutMs = 0) {
 // Returns true if all systems OK
 // ============================================================================
 bool runInitSequence() {
-  // Clean up any previous tft instance (releases I2C_NUM_1 and display
-  // resources) before re-initializing on retry/restart.
-  if (!firstBoot) {
-    tft.end();
-  }
+  // On retry/restart, re-calling tft.begin() reinitializes the display
+  // and touch — no explicit deinit needed (LGFX_Device has no end()).
+  // The previous run already released Wire (I2C_NUM_0) above.
 
   consoleLineCount = 0;
   lastLineComplete = true;
   tftInitialized = false;
   bool allOK = true;
 
-  debugPrintln("CrowPanel Touch Debug Tool v1.1", COLOR_TEXT_NORM);
+  debugPrintln("CrowPanel Touch Debug Tool v1.2", COLOR_TEXT_NORM);
   debugPrintln("--------------------------------", COLOR_TEXT_NORM);
 
   // Step 1: GPIO init (isolate peripherals)
@@ -292,24 +289,44 @@ bool runInitSequence() {
   }
 
   // Step 3: PCA9557 init (required for GT911 power on 7-inch board)
+  // Configured via raw I2C register writes — no PCA9557 library dependency
   {
     bool pcaOK = true;
-    ioExpander.reset();
-    ioExpander.setMode(IO_OUTPUT);
-    ioExpander.setState(IO0, IO_LOW);
-    ioExpander.setState(IO1, IO_LOW);
-    delay(20);
-    ioExpander.setState(IO0, IO_HIGH); // enable GT911 power
-    delay(100);
-    ioExpander.setMode(IO1, IO_INPUT); // GT911 interrupt pin
+    uint8_t pcaAddr = PCA9557_ADDR;
 
-    // Verify PCA9557 responds on I2C (default addr 0x18 or alternate 0x19)
-    Wire.beginTransmission(0x18);
+    // Verify PCA9557 responds on I2C (try default 0x18, then alternate 0x19)
+    Wire.beginTransmission(pcaAddr);
     if (Wire.endTransmission() != 0) {
       Wire.beginTransmission(0x19);
       if (Wire.endTransmission() != 0) {
         pcaOK = false;
+      } else {
+        pcaAddr = 0x19;
       }
+    }
+
+    if (pcaOK) {
+      // Reset: config all-output (reg 0x03 = 0x00), output low (reg 0x01 = 0x00)
+      Wire.beginTransmission(pcaAddr);
+      Wire.write(0x03); Wire.write(0x00); // Config: all outputs
+      Wire.endTransmission();
+      Wire.beginTransmission(pcaAddr);
+      Wire.write(0x01); Wire.write(0x00); // Output: all low
+      Wire.endTransmission();
+
+      delay(20);
+
+      // IO0 HIGH = enable GT911 touch power
+      Wire.beginTransmission(pcaAddr);
+      Wire.write(0x01); Wire.write(0x01); // Output: IO0=HIGH, IO1=LOW
+      Wire.endTransmission();
+
+      delay(100);
+
+      // IO1 as input (GT911 interrupt pin): set bit 1 in config register
+      Wire.beginTransmission(pcaAddr);
+      Wire.write(0x03); Wire.write(0x02); // Config: IO0=output, IO1=input
+      Wire.endTransmission();
     }
 
     debugStep("PCA9557 (I/O expander)... ", pcaOK,
@@ -363,9 +380,8 @@ bool runInitSequence() {
 
   // Step 6: Backlight init (display is on, so user can see from here on)
   {
-    ledcSetup(1, 300, 8);
-    ledcAttachPin(2, 1);
-    ledcWrite(1, 200); // ~78% brightness
+    ledcAttach(2, 300, 8);  // pin 2, 300Hz, 8-bit resolution (Arduino 3.x API)
+    ledcWrite(2, 200); // ~78% brightness
     debugStep("Backlight (GPIO 2)... ", true);
     if (tftInitialized) renderConsole(); // refresh with new line
   }
@@ -632,7 +648,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("CrowPanel Touch Debug Tool v1.1");
+  Serial.println("CrowPanel Touch Debug Tool v1.2");
   Serial.println("================================");
 
   // Run init sequence with retry loop (not recursion)
